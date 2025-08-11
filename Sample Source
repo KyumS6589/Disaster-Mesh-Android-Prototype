@@ -1,0 +1,341 @@
+DisasterMesh - Android Prototype (Kotlin)
+
+This document contains the initial project scaffold and core source files for the DisasterMesh Android prototype (Kotlin). Use these files as a starting point in Android Studio (use "Import project (Gradle)").
+
+
+---
+
+README.md
+
+DisasterMesh - Android Prototype
+
+Description:
+A disaster-ready offline messenger prototype for Android using Wi-Fi Direct + Bluetooth LE for peer discovery and store-and-forward mesh relaying. Includes a foreground service for background relaying and a QR fallback.
+
+Defaults used:
+- Language: Kotlin
+- Min SDK: 23 (Android 6.0) - target SDK: 30+
+- Key components: BLE advertisements & scanning, Wi-Fi P2P, Foreground Service, Room DB, AES-GCM encryption with X25519 ECDH key agreement
+
+How to run:
+1. Open this project in Android Studio.
+2. Ensure Gradle uses Kotlin and Android Gradle Plugin compatible with SDK 30+.
+3. Connect two or more test devices (emulators with Bluetooth limited; physical devices recommended).
+4. Build & install APK on devices and grant required permissions (BLUETOOTH, BLUETOOTH_ADMIN, ACCESS_FINE_LOCATION, ACCESS_WIFI_STATE, CHANGE_WIFI_STATE, FOREGROUND_SERVICE).
+
+Testing plan (quick):
+- Launch app on Device A, B, C
+- On Device A send a broadcast message
+- Verify B receives & stores then forwards to C
+
+Notes & cautions:
+- Modern Android may restrict background scanning; the prototype uses a foreground service to reduce kills.
+- iOS port not included in this prototype.
+
+---
+
+## AndroidManifest.xml (skeleton)
+
+<manifest package="com.example.disastermesh"><uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.BLUETOOTH" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+<uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+<uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+<application
+    android:allowBackup="true"
+    android:label="DisasterMesh">
+
+    <service
+        android:name=".mesh.MeshForegroundService"
+        android:exported="false"
+        android:foregroundServiceType="connectedDevice" />
+
+    <activity android:name=".ui.MainActivity">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+    </activity>
+
+</application>
+
+</manifest>
+```
+---
+
+build.gradle (app) - key deps
+
+plugins {
+    id 'com.android.application'
+    id 'kotlin-android'
+}
+
+android {
+    compileSdk 33
+    defaultConfig {
+        applicationId "com.example.disastermesh"
+        minSdk 23
+        targetSdk 33
+        versionCode 1
+        versionName "0.1"
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.8.0"
+    implementation 'androidx.core:core-ktx:1.9.0'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.8.0'
+
+    // Room
+    implementation 'androidx.room:room-runtime:2.5.2'
+    kapt 'androidx.room:room-compiler:2.5.2'
+
+    // Coroutines
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.0'
+
+    // Crypto - use Bouncycastle or Tink in production. For prototype: libs or pure-Java libs
+    implementation 'org.bouncycastle:bcprov-jdk15on:1.70'
+
+    // Wi-Fi P2P & BLE: platform APIs (no extra libs)
+}
+
+
+---
+
+File: app/src/main/java/com/example/disastermesh/model/Message.kt
+
+package com.example.disastermesh.model
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "messages")
+data class Message(
+    @PrimaryKey val id: String, // UUID
+    val fromId: String,
+    val toId: String?, // null for broadcast
+    val timestamp: Long,
+    val ttl: Int,
+    val encryptedPayload: ByteArray,
+    val signature: ByteArray?,
+    val delivered: Boolean = false
+)
+
+
+---
+
+File: app/src/main/java/com/example/disastermesh/mesh/MessageRouter.kt
+
+package com.example.disastermesh.mesh
+
+import com.example.disastermesh.model.Message
+import kotlinx.coroutines.*
+
+/**
+ * Simple router logic for store-and-forward mesh.
+ * - Keeps a small cache of recent message IDs to avoid duplicates
+ * - Forwards messages to newly discovered peers
+ */
+class MessageRouter(private val sendToPeer: suspend (peerId: String, msg: Message) -> Unit) {
+
+    private val recentIds = ArrayDeque<String>()
+    private val RECENT_LIMIT = 500
+
+    fun seen(msgId: String): Boolean {
+        return recentIds.contains(msgId)
+    }
+
+    fun markSeen(msgId: String) {
+        if (!recentIds.contains(msgId)) {
+            recentIds.addFirst(msgId)
+            if (recentIds.size > RECENT_LIMIT) recentIds.removeLast()
+        }
+    }
+
+    suspend fun handleIncoming(msg: Message, peers: List<String>) {
+        if (seen(msg.id)) return
+        markSeen(msg.id)
+
+        // store message locally (call DB outside)
+
+        if (msg.ttl <= 0) return
+
+        // forward to peers (except where message originated from)
+        coroutineScope {
+            val jobs = peers.map { peer ->
+                async { sendToPeer(peer, msg.copy(ttl = msg.ttl - 1)) }
+            }
+            jobs.awaitAll()
+        }
+    }
+}
+
+
+---
+
+File: app/src/main/java/com/example/disastermesh/mesh/MeshForegroundService.kt
+
+package com.example.disastermesh.mesh
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.*
+
+class MeshForegroundService : Service() {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        val notification: Notification = NotificationCompat.Builder(this, "mesh_channel")
+            .setContentTitle("DisasterMesh")
+            .setContentText("Mesh service running")
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .build()
+        startForeground(1, notification)
+
+        // start discovery loops: BLE scanning, Wi-Fi P2P discovery
+        scope.launch {
+            // TODO: start discovery managers
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel("mesh_channel", "Mesh Service", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(NotificationManager::class.java)).createNotificationChannel(channel)
+        }
+    }
+}
+
+
+---
+
+File: app/src/main/java/com/example/disastermesh/mesh/BleDiscoveryManager.kt (skeleton)
+
+package com.example.disastermesh.mesh
+
+import android.bluetooth.le.AdvertiseCallback
+import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.AdvertiseData
+
+// Skeleton: advertise app presence and scan for peers using BLE adverts.
+class BleDiscoveryManager(private val context: android.content.Context) {
+
+    fun startAdvertising(payload: ByteArray) {
+        // Build AdvertiseSettings & AdvertiseData
+    }
+
+    fun startScanning(onPeerFound: (peerId: String) -> Unit) {
+        // Use BluetoothLeScanner.startScan with ScanCallback
+    }
+
+    fun stop() {
+        // stop adverts & scan
+    }
+}
+
+
+---
+
+File: app/src/main/java/com/example/disastermesh/crypto/CryptoUtils.kt (skeleton)
+
+package com.example.disastermesh.crypto
+
+// Use X25519 ECDH for key agreement and AES-GCM for encryption.
+// For production use, use a vetted library (Tink / BoringSSL / platform keystore).
+
+object CryptoUtils {
+    fun generateKeyPair(): Pair<ByteArray, ByteArray> {
+        // returns (private, public)
+        TODO("Use a library to create X25519 keypair")
+    }
+
+    fun computeSharedSecret(priv: ByteArray, pub: ByteArray): ByteArray {
+        TODO()
+    }
+
+    fun encrypt(sharedSecret: ByteArray, plaintext: ByteArray): ByteArray {
+        TODO()
+    }
+
+    fun decrypt(sharedSecret: ByteArray, ciphertext: ByteArray): ByteArray {
+        TODO()
+    }
+}
+
+
+---
+
+File: app/src/main/java/com/example/disastermesh/ui/MainActivity.kt (skeleton)
+
+package com.example.disastermesh.ui
+
+import android.os.Bundle
+import androidx.appcompat.app.AppCompatActivity
+import com.example.disastermesh.R
+
+class MainActivity: AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        // start foreground service that handles discovery & relaying
+        // bind to service for status updates
+    }
+}
+
+
+---
+
+Testing tips
+
+Use 3 physical Android phones for multi-hop test; emulator BLE soft support is limited.
+
+Use logcat to view discovery & routing logs.
+
+Enable developer options and keep devices awake for easier testing.
+
+
+
+---
+
+Next deliverables (if you want me to continue)
+
+1. Full implementation of BLE advertise/scan handlers and Wi-Fi P2P transfer handlers.
+
+
+2. Room DB entities + DAOs + repository for messages and peers.
+
+
+3. Complete CryptoUtils implementation using a chosen library (BouncyCastle / Tink).
+
+
+4. UI polish and SOS auto-broadcast logic.
+
+
+5. Unit tests + integration test scripts.
+
+
+
+Tell me to continue and I will expand the repository files with full implementations for steps 1–4.
+
